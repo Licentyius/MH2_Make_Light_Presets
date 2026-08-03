@@ -1,0 +1,34 @@
+{
+    "preset_name": "MH2_Studio",
+    "author": "Elvaerwyn_MH2_Community",
+    "notes": "Standard high-key infinity studio setup. Balanced for absolute clarity and high-framerate viewport tracking.",
+    "ambient_luminance": 45.0,
+    "ambient_color": [0.92, 0.92, 0.95],
+    "clear_color": [0.90, 0.90, 0.92],
+    "skybox_name": "default",
+    "floor_texture": "default",
+    "floor_size": 20,
+    "lights": [
+        {
+            "id": 0,
+            "type": 0,
+            "luminance": 7.0,
+            "color": [1.0, 1.0, 1.0],
+            "position": [4.0, 8.0, 6.0]
+        },
+        {
+            "id": 1,
+            "type": 1,
+            "luminance": 4.5,
+            "color": [0.95, 0.95, 0.98],
+            "position": [-5.0, 4.0, 5.0]
+        },
+        {
+            "id": 2,
+            "type": 1,
+            "luminance": 3.5,
+            "color": [0.98, 0.98, 1.0],
+            "position": [0.0, 3.0, -6.0]
+        }
+    ]
+}

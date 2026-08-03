@@ -1,0 +1,34 @@
+{
+    "preset_name": "Studio Indoor Natural Daylight",
+    "author": "Elvaerwyn_MH2_Community",
+    "notes": "Optimized natural window daylight bounce tailored for 4GB VRAM layouts at 144Hz.",
+    "ambient_luminance": 35.0,
+    "ambient_color": [0.78, 0.82, 0.88],
+    "clear_color": [0.08, 0.09, 0.11],
+    "skybox_name": "default",
+    "floor_texture": "default",
+    "floor_size": 15,
+    "lights": [
+        {
+            "id": 0,
+            "type": 0,
+            "luminance": 6.5,
+            "color": [0.98, 0.95, 0.88],
+            "position": [8.0, 6.0, 10.0]
+        },
+        {
+            "id": 1,
+            "type": 1,
+            "luminance": 2.5,
+            "color": [0.82, 0.88, 0.95],
+            "position": [-6.0, 3.0, 4.0]
+        },
+        {
+            "id": 2,
+            "type": 1,
+            "luminance": 1.8,
+            "color": [0.95, 0.92, 0.88],
+            "position": [0.0, 2.0, -8.0]
+        }
+    ]
+}

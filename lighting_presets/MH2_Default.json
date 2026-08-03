@@ -1,0 +1,74 @@
+{
+    "preset_name": "MH2_Default",
+    "author": "MH2_Community_Default",
+    "notes": "Custom studio setup.",
+    "ambient_luminance": 34.99999940395355,
+    "ambient_color": [
+        1.0,
+        1.0,
+        1.0
+    ],
+    "clear_color": [
+        0.05,
+        0.05,
+        0.05
+    ],
+    "floor_texture": "default",
+    "floor_size": 10,
+    "floor_color": [
+        0.5,
+        0.5,
+        0.5
+    ],
+    "harsh_key_light": false,
+    "use_blinn_shading": false,
+    "use_toon_shading": false,
+    "material_specular_focus": 32,
+    "lights": [
+        {
+            "id": 0,
+            "type": 0,
+            "luminance": 7.0,
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "position": [
+                8.5,
+                8.0,
+                6.5
+            ]
+        },
+        {
+            "id": 1,
+            "type": 0,
+            "luminance": 8.0,
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "position": [
+                -12.0,
+                6.0,
+                6.5
+            ]
+        },
+        {
+            "id": 2,
+            "type": 0,
+            "luminance": 5.0,
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "position": [
+                -0.4,
+                7.0,
+                -10.0
+            ]
+        }
+    ]
+}
