@@ -40,4 +40,6 @@ makehuman2/
 First open up makehuman 2, then pull down the community plugins menu in mh2(settings-community plugins), you should see the plugin panel open up to  
 allow any installed extensions to be used. Enable the plugin. At present this should open it right up as a fully dockable window of its own.  
 
+The filename for this to operate is make_light_presets(needs to be exactly this).
+
   
