@@ -1,0 +1,20 @@
+Changes are mainly handling the following topics:
+
+Docking:
+
+* using load and unload extension function to work properly with global repo
+* unload cleans up timers as well
+* QDockWidget.DockWidgetClosable is taken out otherwise a contradictionary behaviour will occur.
+
+Endpoints:
+* after adding documented endpoints for light and floor, code could be simplified (no try or hasattr needed)
+* floor color is not supported since this attribute is not available in MakeHuman2
+
+Features:
+* pause and resume added mainly to try other assets without being confused :)
+
+Possible Linux/Windows/Steam problems:
+* saving of presets is NOT done in system path (this path is not necessarily writable) but in an additional user path.
+
+
+As always it looks like it is changed a 100% but it is mostly indentation.
