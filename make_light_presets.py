@@ -14,60 +14,6 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QColor, QVector4D, QPalette, QBrush
 
-# Persistent global window state dictionary to maintain undocked float dimensions
-_community_light_dock_instance = None
-_community_dock_geometry_profile = {
-    "floating_size": QSize(450, 600),
-    "was_floating": False
-}
-
-def initialize_extension(app_reference, glob_reference):
-    """Fires automatically when the application boots and registers extensions."""
-    global _community_light_dock_instance, _community_dock_geometry_profile
-    
-    main_window = None
-    for widget in QApplication.topLevelWidgets():
-        if isinstance(widget, QMainWindow) or widget.objectName() == "mainwindow" or hasattr(widget, "central_widget"):
-            main_window = widget
-            break
-    if not main_window:
-        main_window = app_reference
-
-    if _community_light_dock_instance is not None:
-        if _community_light_dock_instance.isVisible():
-            _community_light_dock_instance.hide()
-        else:
-            _community_light_dock_instance.show()
-            _community_light_dock_instance.raise_()
-        return True
-
-    _community_light_dock_instance = QDockWidget("Community Lighting Presets Manager", main_window)
-    _community_light_dock_instance.setObjectName("community_light_presets_dock_frame")
-    _community_light_dock_instance.setFeatures(
-        QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable
-    )
-    _community_light_dock_instance.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
-
-    panel_content = CommunityLightPresetPanel(main_window, glob_reference)
-    _community_light_dock_instance.setWidget(panel_content)
-
-    _community_light_dock_instance.setFloating(_community_dock_geometry_profile["was_floating"])
-    _community_light_dock_instance.resize(_community_dock_geometry_profile["floating_size"])
-
-    def intercept_dock_state_mutations(is_floating):
-        _community_dock_geometry_profile["was_floating"] = is_floating
-        if is_floating:
-            _community_light_dock_instance.resize(_community_dock_geometry_profile["floating_size"])
-        panel_content.refresh_visual_dock_status_string()
-
-    _community_light_dock_instance.topLevelChanged.connect(intercept_dock_state_mutations)
-    
-    if hasattr(main_window, "addDockWidget"):
-        main_window.addDockWidget(Qt.RightDockWidgetArea, _community_light_dock_instance)
-        
-    _community_light_dock_instance.show()
-    return True
-
 class SavePresetMetadataDialog(QDialog):
     """Custom input workspace window allowing manual entry of profile metadata."""
     def __init__(self, parent_widget, default_name=""):
@@ -102,21 +48,24 @@ class SavePresetMetadataDialog(QDialog):
 
 class CommunityLightPresetPanel(QWidget):
     """The master layout widget handling folder scans, selection clicks, and dock-locking."""
-    def __init__(self, main_window, glob_reference):
-        super().__init__(main_window) 
-        self.main_window = main_window
+    def __init__(self,  app_reference, glob_reference, pluginname):
         self.glob = glob_reference
+        self.main_window = self.glob.MainWindow
+        self.mh_app = app_reference
+        self.pluginname = pluginname
+        super().__init__(self.glob.MainWindow)
         
         self.view = self.glob.openGLWindow
-        self.env = main_window.env
+        self.env = self.glob.env
         self.light_sys = self.view.light
         self.scene_sys = self.view.scene
         
-        self._volume = 100.0 / (np.array(self.light_sys.max_coords) - np.array(self.light_sys.min_coords))
+        # presets can be saved, so it will be sys_presets_dir and user_presets_dir
+        #
+        self.current_dir = os.path.dirname(pluginname)
+        self.sys_presets_dir = self.glob.env.fullPath(os.path.join(self.current_dir, "lighting_presets"))
+        self.user_presets_dir = self.glob.env.fullPath(os.path.join(self.glob.env.stdUserPath(), "lighting_presets"))
 
-        self.current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.presets_dir = os.path.normpath(os.path.join(self.current_dir, "lighting_presets")).replace("\\", "/")
-        
         # Build out lookups dynamically inside the isolated extension directory
         self.gobos_dir = os.path.normpath(os.path.join(self.current_dir, "light_gobos")).replace("\\", "/")
         if not os.path.exists(self.gobos_dir):
@@ -129,176 +78,183 @@ class CommunityLightPresetPanel(QWidget):
             except Exception: pass
 
         self.scanned_presets = {}
-        self.init_ui()
-        self.scan_presets_folder()
-        self.initialize_live_viewport_tracking_heartbeat()
+        self.repo = self.glob.pluginRepo
+        self.dock = None
+        self.panel = None
+
+        self.tracking_timer = None
+        self.fx_math_timer = None
+        self.pause = False
+
+    class Panel(QWidget):
+        def __init__(self, parent):
+            super().__init__()
+
+            self.parent = parent
+            layout = QVBoxLayout(self)
+            layout.setSpacing(6)
+            layout.setContentsMargins(8, 8, 8, 8)
+
+            self.dock_status_banner = QLabel("📌 Status: Docked (Drag header out to float)")
+            self.dock_status_banner.setAlignment(Qt.AlignCenter)
+            self.dock_status_banner.setWordWrap(True)
+            self.dock_status_banner.setMinimumHeight(28)
+            self.dock_status_banner.setStyleSheet("""
+                QLabel {
+                    font-weight: bold;
+                    border: 1px solid rgba(128, 128, 128, 60);
+                    border-radius: 3px;
+                    padding: 4px;
+                    background-color: rgba(128, 128, 128, 15);
+                }
+            """)
+            layout.addWidget(self.dock_status_banner)
+
+            self.lock_layout_toggle = QCheckBox("🔒 Lock Preset Panel Dock Frame")
+            self.lock_layout_toggle.setChecked(False)
+            self.lock_layout_toggle.stateChanged.connect(parent.toggle_panel_dock_lock)
+            layout.addWidget(self.lock_layout_toggle)
+
+            layout.addWidget(QLabel("<b>Available Community Style Presets:</b>"))
         
-        QTimer.singleShot(100, self.establish_dock_signal_tracking_hooks)
-
-    def resizeEvent(self, event):
-        """Monitors panel size resizing modifications to persist un-docked profile settings."""
-        super().resizeEvent(event)
-        global _community_dock_geometry_profile, _community_light_dock_instance
-        if _community_light_dock_instance and _community_light_dock_instance.isFloating():
-            _community_dock_geometry_profile["floating_size"] = _community_light_dock_instance.size()
-
-    def init_ui(self):
-        if self.layout() is not None:
-            return
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(6)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        self.dock_status_banner = QLabel("📌 Status: Docked (Drag header out to float)")
-        self.dock_status_banner.setAlignment(Qt.AlignCenter)
-        self.dock_status_banner.setWordWrap(True)
-        self.dock_status_banner.setMinimumHeight(28)
-        self.dock_status_banner.setStyleSheet("""
-            QLabel {
-                font-weight: bold;
-                border: 1px solid rgba(128, 128, 128, 60);
-                border-radius: 3px;
-                padding: 4px;
-                background-color: rgba(128, 128, 128, 15);
-            }
-        """)
-        layout.addWidget(self.dock_status_banner)
-
-        self.lock_layout_toggle = QCheckBox("🔒 Lock Preset Panel Dock Frame")
-        self.lock_layout_toggle.setChecked(False)
-        self.lock_layout_toggle.stateChanged.connect(self.toggle_panel_dock_lock)
-        layout.addWidget(self.lock_layout_toggle)
-
-        layout.addWidget(QLabel("<b>Available Community Style Presets:</b>"))
+            self.preset_list = QListWidget()
+            self.preset_list.itemDoubleClicked.connect(parent.execute_selected_preset)
+            layout.addWidget(self.preset_list)
         
-        self.preset_list = QListWidget()
-        self.preset_list.itemDoubleClicked.connect(self.execute_selected_preset)
-        layout.addWidget(self.preset_list)
+            # FX Dropdowns configuration layout form
+            fx_layout = QFormLayout()
+            fx_layout.setSpacing(4)
         
-        # FX Dropdowns configuration layout form 
-        fx_layout = QFormLayout()
-        fx_layout.setSpacing(4)
+            self.gobo_picker = QComboBox()
+            self.gobo_picker.addItem("❌ No Decal Mask", "none")
+            # Added explicit procedural gobo profiles to match math loop conditions
+            self.gobo_picker.addItem("🌊 Algorithmic Wave Bands", "wave")
+            self.gobo_picker.addItem("🏁 Grid Coordinate Mask", "grid")
+            fx_layout.addRow("Procedural Math Gobo:", self.gobo_picker)
         
-        self.gobo_picker = QComboBox()
-        self.gobo_picker.addItem("❌ No Decal Mask", "none")
-        # Added explicit procedural gobo profiles to match math loop conditions
-        self.gobo_picker.addItem("🌊 Algorithmic Wave Bands", "wave")
-        self.gobo_picker.addItem("🏁 Grid Coordinate Mask", "grid")
-        fx_layout.addRow("Procedural Math Gobo:", self.gobo_picker)
+            self.lut_picker = QComboBox()
+            self.lut_picker.addItem("❌ No Grading LUT", "none")
+            # Added explicit procedural grading profiles to pass conditions
+            self.lut_picker.addItem("🔥 Warm Amber Grade", "warm")
+            fx_layout.addRow("Procedural Math LUT:", self.lut_picker)
         
-        self.lut_picker = QComboBox()
-        self.lut_picker.addItem("❌ No Grading LUT", "none")
-        # Added explicit procedural grading profiles to pass conditions
-        self.lut_picker.addItem("🔥 Warm Amber Grade", "warm")
-        fx_layout.addRow("Procedural Math LUT:", self.lut_picker)
+            self.procedural_picker = QComboBox()
+            self.procedural_picker.addItem("❌ No Math Routine", "none")
+            self.procedural_picker.addItem("🎉 Rainbow Confetti Shimmer", "confetti_shimmer")
+            self.procedural_picker.addItem("🌊 Water Ripple Cavern Sine", "water_ripple")
+            self.procedural_picker.addItem("🪩 Mirror Disco Ball Rotation", "disco_ball")
+            self.procedural_picker.addItem("💎 Window Crystal Prism Rainbow", "crystal_prism")
+            self.procedural_picker.addItem("🦋 Classic Butterfly Portrait", "butterfly")
+            self.procedural_picker.addItem("▫️ Flat Shadowless Fill", "flat_fill")
+            self.procedural_picker.addItem("😇 Perimeter Rim Halo Glow", "rim_halo")
+            self.procedural_picker.addItem("🌋 Skyroom Cubemap Shift", "skyroom_shift")
+
+            # FIXED: Registered new organic fluid and fire flickering math keys into the UI menu
+            self.procedural_picker.addItem("🧪 Psychedelic Lava Lamp Blobs", "lava_lamp")
+            self.procedural_picker.addItem("🕯️ Erratic Candlelight Flicker", "candle_flicker")
+            fx_layout.addRow("Procedural Math FX:", self.procedural_picker)
         
-        self.procedural_picker = QComboBox()
-        self.procedural_picker.addItem("❌ No Math Routine", "none")
-        self.procedural_picker.addItem("🎉 Rainbow Confetti Shimmer", "confetti_shimmer")
-        self.procedural_picker.addItem("🌊 Water Ripple Cavern Sine", "water_ripple")
-        self.procedural_picker.addItem("🪩 Mirror Disco Ball Rotation", "disco_ball")
-        self.procedural_picker.addItem("💎 Window Crystal Prism Rainbow", "crystal_prism")
-        self.procedural_picker.addItem("🦋 Classic Butterfly Portrait", "butterfly")
-        self.procedural_picker.addItem("▫️ Flat Shadowless Fill", "flat_fill")
-        self.procedural_picker.addItem("😇 Perimeter Rim Halo Glow", "rim_halo")
-        self.procedural_picker.addItem("🌋 Skyroom Cubemap Shift", "skyroom_shift")
+            # FIXED: Added the Amount menu mapping value string configurations accurately
+            self.amount_picker = QComboBox()
+            for i in range(1, 11):
+                self.amount_picker.addItem(f"📊 Level Setting: {i}", str(i))
+            self.amount_picker.setCurrentIndex(4) # Default value setting is 5
+            fx_layout.addRow("FX Amount Preset (1-10):", self.amount_picker)
 
-        # FIXED: Registered new organic fluid and fire flickering math keys into the UI menu
-        self.procedural_picker.addItem("🧪 Psychedelic Lava Lamp Blobs", "lava_lamp")
-        self.procedural_picker.addItem("🕯️ Erratic Candlelight Flicker", "candle_flicker")
-        fx_layout.addRow("Procedural Math FX:", self.procedural_picker)
+            # NEW: Added a PC Performance optimization selector
+            self.hardware_picker = QComboBox()
+            self.hardware_picker.setToolTip("Optimize math calculation speeds based on your system hardware.")
+            self.hardware_picker.addItem("💻 Balanced PC Profile (30 FPS Standard)", "balanced")
+            self.hardware_picker.addItem("🥔 Low-End PC / Laptop Profile (Battery & CPU Safe)", "low_end")
+            self.hardware_picker.addItem("🚀 High-End Gaming PC Profile (Ultra-Smooth 60 FPS)", "high_end")
+            self.hardware_picker.setCurrentIndex(0) # Default to Balanced
+            fx_layout.addRow("Hardware Optimization:", self.hardware_picker)
         
-        # FIXED: Added the Amount menu mapping value string configurations accurately
-        self.amount_picker = QComboBox()
-        for i in range(1, 11):
-            self.amount_picker.addItem(f"📊 Level Setting: {i}", str(i))
-        self.amount_picker.setCurrentIndex(4) # Default value setting is 5
-        fx_layout.addRow("FX Amount Preset (1-10):", self.amount_picker)
+            # Connect it so changing the PC profile updates the timer speed instantly
+            self.hardware_picker.currentIndexChanged.connect(parent.toggle_procedural_math_engine)
 
-        # NEW: Added a PC Performance optimization selector
-        self.hardware_picker = QComboBox()
-        self.hardware_picker.setToolTip("Optimize math calculation speeds based on your system hardware.")
-        self.hardware_picker.addItem("💻 Balanced PC Profile (30 FPS Standard)", "balanced")
-        self.hardware_picker.addItem("🥔 Low-End PC / Laptop Profile (Battery & CPU Safe)", "low_end")
-        self.hardware_picker.addItem("🚀 High-End Gaming PC Profile (Ultra-Smooth 60 FPS)", "high_end")
-        self.hardware_picker.setCurrentIndex(0) # Default to Balanced
-        fx_layout.addRow("Hardware Optimization:", self.hardware_picker)
+
+            self.gobo_picker.currentIndexChanged.connect(parent.apply_selected_gobo_decal)
+            self.lut_picker.currentIndexChanged.connect(parent.apply_selected_lut_profile)
+            self.procedural_picker.currentIndexChanged.connect(parent.toggle_procedural_math_engine)
+            layout.addLayout(fx_layout)
+
+            btn_layout = QHBoxLayout()
+            # CRITICAL UPGRADE: Reset Engine Button row to clear active FX wrappers completely
+            self.clear_fx_btn = QPushButton("🛑 Deactivate Overrides & Clear Active FX")
+            self.clear_fx_btn.setToolTip("Instantly remove math gobos, disable look-up matrices, disable skin shading overrides, and reset math engine calculations.")
+            self.clear_fx_btn.setStyleSheet("color: rgba(220, 53, 69, 255)")
+            self.clear_fx_btn.clicked.connect(parent.deactivate_all_fx_overrides)
+            btn_layout.addWidget(self.clear_fx_btn)
+            self.toggle_effects = QPushButton()
+            self.setPauseText()
+            self.toggle_effects.setToolTip("Pause effects / Resume effects")
+            self.toggle_effects.clicked.connect(parent.pause_or_resume)
+            btn_layout.addWidget(self.toggle_effects)
+            layout.addLayout(btn_layout)
         
-        # Connect it so changing the PC profile updates the timer speed instantly
-        self.hardware_picker.currentIndexChanged.connect(self.toggle_procedural_math_engine)
+            # Scan folders to retain backwards file support for legacy assets
+            if os.path.isdir(parent.gobos_dir):
+                for filename in os.listdir(parent.gobos_dir):
+                    if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        self.gobo_picker.addItem(f"🖼️ File: {filename}", filename)
 
+            if os.path.isdir(parent.luts_dir):
+                for filename in os.listdir(parent.luts_dir):
+                    if filename.lower().endswith(('.png', '.cube', '.jpg')):
+                        self.lut_picker.addItem(f"🎨 File: {filename}", filename)
 
-        self.gobo_picker.currentIndexChanged.connect(self.apply_selected_gobo_decal)
-        self.lut_picker.currentIndexChanged.connect(self.apply_selected_lut_profile)
-        self.procedural_picker.currentIndexChanged.connect(self.toggle_procedural_math_engine)
-        layout.addLayout(fx_layout)
+            # SHADER COMPLIANCE BLOCK
+            cam_group = QGroupBox("🎥 Studio Light Focus, Shaders & Falloff")
+            cam_layout = QFormLayout(cam_group)
+            cam_layout.setSpacing(6)
 
-        # CRITICAL UPGRADE: Reset Engine Button row to clear active FX wrappers completely
-        self.clear_fx_btn = QPushButton("🛑 Deactivate Overrides & Clear Active FX")
-        self.clear_fx_btn.setToolTip("Instantly remove math gobos, disable look-up matrices, disable skin shading overrides, and reset math engine calculations.")
-        self.clear_fx_btn.setStyleSheet("background-color: rgba(220, 53, 69, 30); font-weight: bold; border: 1px solid rgba(220, 53, 69, 80); border-radius: 3px; padding: 4px;")
-        self.clear_fx_btn.clicked.connect(self.deactivate_all_fx_overrides)
-        layout.addWidget(self.clear_fx_btn)
+            self.harsh_light_toggle = QCheckBox("Enable Sharp Directional Key Lighting")
+            self.harsh_light_toggle.setChecked(False)
+            self.harsh_light_toggle.stateChanged.connect(parent.apply_cinematic_fx_to_viewport)
+            cam_layout.addRow("Harsh Light Ray:", self.harsh_light_toggle)
+
+            self.blinn_toggle = QCheckBox("Use Soft Blinn-Phong Skin Reflections")
+            self.blinn_toggle.setChecked(False)
+            self.blinn_toggle.stateChanged.connect(parent.apply_cinematic_fx_to_viewport)
+            cam_layout.addRow("Blinn Shading:", self.blinn_toggle)
+
+            self.toon_toggle = QCheckBox("Enable Math LitSphere Cel-Shading")
+            self.toon_toggle.setChecked(False)
+            self.toon_toggle.stateChanged.connect(parent.apply_cinematic_fx_to_viewport)
+            cam_layout.addRow("Toon LitSphere Shading:", self.toon_toggle)
+
+            self.specular_slider = QSlider(Qt.Horizontal)
+            self.specular_slider.setRange(1, 128)
+            self.specular_slider.setValue(32)
+            self.specular_slider.valueChanged.connect(parent.apply_cinematic_fx_to_viewport)
+            cam_layout.addRow("Material Specular Focus:", self.specular_slider)
+
+            layout.addWidget(cam_group)
+
+            btn_layout = QHBoxLayout()
+            load_btn = QPushButton("🔵 Load Selected Profile")
+            load_btn.clicked.connect(parent.execute_button_click_load)
+            btn_layout.addWidget(load_btn)
         
-        # Scan folders to retain backwards file support for legacy assets
-        if os.path.isdir(self.gobos_dir):
-            for filename in os.listdir(self.gobos_dir):
-                if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    self.gobo_picker.addItem(f"🖼️ File: {filename}", filename)
-
-        if os.path.isdir(self.luts_dir):
-            for filename in os.listdir(self.luts_dir):
-                if filename.lower().endswith(('.png', '.cube', '.jpg')):
-                    self.lut_picker.addItem(f"🎨 File: {filename}", filename)
-
-        # SHADER COMPLIANCE BLOCK
-        cam_group = QGroupBox("🎥 Studio Light Focus, Shaders & Falloff")
-        cam_layout = QFormLayout(cam_group)
-        cam_layout.setSpacing(6)
-
-        self.harsh_light_toggle = QCheckBox("Enable Sharp Directional Key Lighting")
-        self.harsh_light_toggle.setChecked(False)
-        self.harsh_light_toggle.stateChanged.connect(self.apply_cinematic_fx_to_viewport)
-        cam_layout.addRow("Harsh Light Ray:", self.harsh_light_toggle)
-
-        self.blinn_toggle = QCheckBox("Use Soft Blinn-Phong Skin Reflections")
-        self.blinn_toggle.setChecked(False)
-        self.blinn_toggle.stateChanged.connect(self.apply_cinematic_fx_to_viewport)
-        cam_layout.addRow("Blinn Shading:", self.blinn_toggle)
-
-        self.toon_toggle = QCheckBox("Enable Math LitSphere Cel-Shading")
-        self.toon_toggle.setChecked(False)
-        self.toon_toggle.stateChanged.connect(self.apply_cinematic_fx_to_viewport)
-        cam_layout.addRow("Toon LitSphere Shading:", self.toon_toggle)
-
-        self.specular_slider = QSlider(Qt.Horizontal)
-        self.specular_slider.setRange(1, 128)
-        self.specular_slider.setValue(32)
-        self.specular_slider.valueChanged.connect(self.apply_cinematic_fx_to_viewport)
-        cam_layout.addRow("Material Specular Focus:", self.specular_slider)
-
-        layout.addWidget(cam_group)
-
-        btn_layout = QHBoxLayout()
-        load_btn = QPushButton("🔵 Load Selected Profile")
-        load_btn.clicked.connect(self.execute_button_click_load)
-        btn_layout.addWidget(load_btn)
+            refresh_btn = QPushButton("🔄 Refresh Catalog")
+            refresh_btn.clicked.connect(parent.scan_presets_folder)
+            btn_layout.addWidget(refresh_btn)
         
-        refresh_btn = QPushButton("🔄 Refresh Catalog")
-        refresh_btn.clicked.connect(self.scan_presets_folder)
-        btn_layout.addWidget(refresh_btn)
-        
-        save_btn = QPushButton("🟢 Capture Setup")
-        save_btn.clicked.connect(self.capture_and_save_active_preset)
-        btn_layout.addWidget(save_btn)
+            save_btn = QPushButton("🟢 Capture Setup")
+            save_btn.clicked.connect(parent.capture_and_save_active_preset)
+            btn_layout.addWidget(save_btn)
 
-        self.delete_btn = QPushButton("❌ Delete")
-        self.delete_btn.clicked.connect(self.delete_selected_preset)
-        btn_layout.addWidget(self.delete_btn)
-        layout.addLayout(btn_layout)
+            self.delete_btn = QPushButton("❌ Delete")
+            self.delete_btn.clicked.connect(parent.delete_selected_preset)
+            btn_layout.addWidget(self.delete_btn)
+            layout.addLayout(btn_layout)
         
-        self.original_scene_backup = None
+            self.original_scene_backup = None
+
+        def setPauseText(self):
+            t = ["Pause", "Resume"]
+            self.toggle_effects.setText(t[(int(self.parent.pause))])
 
     def establish_dock_signal_tracking_hooks(self):
         """Safely hooks into the parent frame wrappers to monitor dragging states."""
@@ -392,80 +348,71 @@ class CommunityLightPresetPanel(QWidget):
             # Pack the entire room baseline together
             self.original_scene_backup = {
                 "lights": backup_lights,
-                "harsh_key_light": self.harsh_light_toggle.isChecked(),
-                "use_blinn_shading": self.blinn_toggle.isChecked(),
-                "use_toon_shading": self.toon_toggle.isChecked(),
-                "material_specular_focus": self.specular_slider.value()
+                "harsh_key_light": self.panel.harsh_light_toggle.isChecked(),
+                "use_blinn_shading": self.panel.blinn_toggle.isChecked(),
+                "use_toon_shading": self.panel.toon_toggle.isChecked(),
+                "material_specular_focus": self.panel.specular_slider.value()
             }
-            print("[Preset Engine] Original lighting setup securely cached in memory.")
+            self.glob.env.logLine(2, "[Preset Engine] Original lighting setup securely cached in memory.")
         except Exception as e:
-            print(f"[Preset Engine Warning] Failed to cache user's scene state: {str(e)}")
+            self.glob.env.logLine(1, f"[Preset Engine Warning] Failed to cache user's scene state: {str(e)}")
 
     def apply_cinematic_fx_to_viewport(self):
         """Passes specular focus boundaries and shading loops straight to the pipeline."""
         if not self.view or not self.light_sys:
             return
             
-        try:
-            # 1. NATIVE REFLECTION ASSIGNMENT
-            self.light_sys.blinn = self.blinn_toggle.isChecked()
+        # 1. NATIVE REFLECTION ASSIGNMENT
+        self.light_sys.blinn = self.panel.blinn_toggle.isChecked()
 
-            # 2. NATIVE SHADOW LIGHT TYPE SWITCHER
-            if hasattr(self.light_sys, 'lights') and len(self.light_sys.lights) > 0:
-                is_directional = self.harsh_light_toggle.isChecked()
+        # 2. LIGHT TYPE SWITCHER, switch first of the 3 lights
+        is_directional = self.panel.harsh_light_toggle.isChecked()
+        self.light_sys.lights[0]["type"] = 0 if is_directional else 1
                 
-                # Check for list array encapsulation formats or raw multi-object profiles
-                if isinstance(self.light_sys.lights, list):
-                    self.light_sys.lights[0]["type"] = 0 if is_directional else 1
-                else:
-                    self.light_sys.lights["type"] = 0 if is_directional else 1
-                
-                # 3. NATIVE SPECULAR FOCUS RANGE ASSIGNMENT
-                if hasattr(self.light_sys, 'lightWeight'):
-                    gloss_factor = float(self.specular_slider.value())
-                    if hasattr(self.light_sys.lightWeight, 'setY'):
-                        self.light_sys.lightWeight.setY(gloss_factor)
-                    else:
-                        self.light_sys.lightWeight = gloss_factor
-                
-                if hasattr(self.light_sys, 'setShader'):
-                    self.light_sys.setShader()
+        # specularFocus is placed in Y value
+        gloss_factor = float(self.panel.specular_slider.value())
+        self.light_sys.lightWeight.setY(gloss_factor)
+        self.light_sys.setShader()
 
-            # 4. FORCE REPAINT UPDATE
-            self.view.Tweak()
-            if hasattr(self.view, 'update'):
-                self.view.update()
+        # 4. FORCE REPAINT UPDATE (Tweak includes update)
+        self.view.Tweak()
                 
-        except Exception as e:
-            print(f"[Studio Engine Error] Core landscape matrix modification collapsed: {str(e)}")
-
-    def scan_presets_folder(self):
-        self.preset_list.clear()
-        self.scanned_presets.clear()
-        
-        if not os.path.exists(self.presets_dir):
-            try: os.makedirs(self.presets_dir)
+    def create_presets_directories(self):
+        """
+        we do that only on tool startup
+        """
+        if not os.path.exists(self.sys_presets_dir):
+            try: os.makedirs(self.sys_presets_dir)
             except Exception: pass
 
-        if os.path.isdir(self.presets_dir):
-            for filename in os.listdir(self.presets_dir):
-                if filename.lower().endswith('.json'):
-                    full_path = os.path.join(self.presets_dir, filename).replace("\\", "/")
-                    try:
-                        with open(full_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            self.scanned_presets[filename] = data
+        if not os.path.exists(self.user_presets_dir):
+            try: os.makedirs(self.user_presets_dir)
+            except Exception: pass
+
+    def scan_presets_folder(self):
+        self.panel.preset_list.clear()
+        self.scanned_presets.clear()
+        
+        for predir in (self.sys_presets_dir, self.user_presets_dir):
+            if os.path.isdir(predir):
+                for filename in os.listdir(predir):
+                    if filename.lower().endswith('.json'):
+                        full_path = os.path.join(predir, filename).replace("\\", "/")
+                        try:
+                            with open(full_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                self.scanned_presets[filename] = data
                             
-                            name = data.get("preset_name", filename)
-                            item = QListWidgetItem(f"💡 {name} (by {data.get('author', 'Community')})")
-                            item.setData(Qt.UserRole, filename) 
-                            self.preset_list.addItem(item)
-                    except Exception:
-                        pass
+                                name = data.get("preset_name", filename)
+                                item = QListWidgetItem(f"💡 {name} (by {data.get('author', 'Community')})")
+                                item.setData(Qt.UserRole, filename)
+                                self.panel.preset_list.addItem(item)
+                        except Exception:
+                            pass
 
     def execute_button_click_load(self):
         """Passes the highlighted row selection directly into the execution track."""
-        selected_item = self.preset_list.currentItem()
+        selected_item = self.panel.preset_list.currentItem()
         if not selected_item:
             QMessageBox.warning(
                 self, "No Selection", 
@@ -505,11 +452,6 @@ class CommunityLightPresetPanel(QWidget):
             if "floor_texture" in config:
                 self.scene_sys.modFloorTexture(str(config["floor_texture"]))
 
-            if "floor_color" in config and hasattr(self.scene_sys, 'setFloorColor'):
-                fc = config["floor_color"]
-                if isinstance(fc, (list, tuple)) and len(fc) >= 3:
-                    self.scene_sys.setFloorColor(QColor.fromRgbF(*fc[:3]))
-
             if "lights" in config:
                 for l_data in config["lights"]:
                     l_idx = int(l_data.get("id", 0))
@@ -539,74 +481,93 @@ class CommunityLightPresetPanel(QWidget):
                         self.light_sys.setHPos(l_idx, 5.0)
 
             # Safely sync studio interface values whenever a preset is double-clicked
-            self.harsh_light_toggle.setChecked(config.get("harsh_key_light", False))
-            self.blinn_toggle.setChecked(config.get("use_blinn_shading", False))
-            self.toon_toggle.setChecked(config.get("use_toon_shading", False))
-            self.specular_slider.setValue(int(config.get("material_specular_focus", 32)))
+            self.panel.harsh_light_toggle.setChecked(config.get("harsh_key_light", False))
+            self.panel.blinn_toggle.setChecked(config.get("use_blinn_shading", False))
+            self.panel.toon_toggle.setChecked(config.get("use_toon_shading", False))
+            self.panel.specular_slider.setValue(int(config.get("material_specular_focus", 32)))
             
             self.apply_cinematic_fx_to_viewport()
             self.view.Tweak()
-            print(f"[Preset Engine] Successfully ran style footprint: {config.get('preset_name')}")
-            
-            if hasattr(self.main_window, 'updateGui'):
-                self.main_window.updateGui()
-            elif hasattr(self.main_window, 'signal_handler') and hasattr(self.main_window.signal_handler, 'emit'):
-                try: self.main_window.signal_handler.emit("sceneChanged")
-                except Exception: pass
-            else:
-                for widget in self.main_window.findChildren(QWidget):
-                    if str(widget.objectName()).lower() in ("sliders", "lighting_panel", "scene_window", "colorpalette"):
-                        widget.update()
+            self.glob.env.logLine(1, f"[Make Light, Preset Engine] Successfully ran style footprint: {config.get('preset_name')}")
             
         except Exception as e:
-            print(f"[Preset Engine Error] Runtime setup failure: {str(e)}")
+            self.glob.env.logLine(1, f"[Make Light, Preset Engine Error] Runtime setup failure: {str(e)}")
 
     def apply_selected_gobo_decal(self):
         """Passes algorithmic projection configurations to the mesh calculation loops."""
-        gobo_mode = self.gobo_picker.currentData()
-        print(f"[Preset FX] Gobo processing profile swapped to math matrix: {gobo_mode}")
-        if self.view:
-            self.view.Tweak()
+        gobo_mode = self.panel.gobo_picker.currentData()
+        self.glob.env.logLine(2, f"[Make Light, Preset FX] Gobo processing profile swapped to math matrix: {gobo_mode}")
+        self.view.Tweak()
 
     def apply_selected_lut_profile(self):
         """Engages numerical camera lookup grading layers inside the drawing track."""
-        lut_mode = self.lut_picker.currentData()
-        print(f"[Preset FX] Color calibration grading offset applied: {lut_mode}")
-        if self.view:
-            self.view.Tweak()
+        lut_mode = self.panel.lut_picker.currentData()
+        self.glob.env.logLine(2, f"[Make Light, Preset FX] Color calibration grading offset applied: {lut_mode}")
+        self.view.Tweak()
+
+    def delete_fx_math_timer(self):
+        if self.fx_math_timer is not None:
+            self.fx_math_timer.stop()
+            self.fx_math_timer = None
+
+    def stop_fx_math_timer(self):
+        if self.fx_math_timer is not None:
+            self.fx_math_timer.stop()
+
+    def start_fx_math_timer(self):
+        if self.fx_math_timer is not None:
+            self.fx_math_timer.start()
+
+    def stop_tracking_timer(self):
+        if self.tracking_timer is not None:
+            self.tracking_timer.stop()
+
+    def start_tracking_timer(self):
+        if self.tracking_timer is not None:
+            self.tracking_timer.start()
 
     def deactivate_all_fx_overrides(self):
         """CRITICAL MASTER RESET: Unlocks all persistent states, stops loops, and clears hooks instantly."""
-        print("[Preset Engine] Commencing emergency FX deactivation sequence...")
+        self.glob.env.logLine(1, "[Make Light, Preset Engine] Commencing FX deactivation sequence...")
         try:
             # 1. Stop background math engines completely
-            self.procedural_picker.setCurrentIndex(0)
-            if hasattr(self, 'fx_math_timer'):
-                self.fx_math_timer.stop()
+            self.panel.procedural_picker.setCurrentIndex(0)
+            self.delete_fx_math_timer()
             
             # 2. Reset combo boxes to baseline indices
-            self.gobo_picker.setCurrentIndex(0)
-            self.lut_picker.setCurrentIndex(0)
+            self.panel.gobo_picker.setCurrentIndex(0)
+            self.panel.lut_picker.setCurrentIndex(0)
             
             # 3. Drop layout checkboxes back to standard definitions
-            self.harsh_light_toggle.setChecked(False)
-            self.blinn_toggle.setChecked(False)
-            self.toon_toggle.setChecked(False)
-            self.specular_slider.setValue(32)
+            self.panel.harsh_light_toggle.setChecked(False)
+            self.panel.blinn_toggle.setChecked(False)
+            self.panel.toon_toggle.setChecked(False)
+            self.panel.specular_slider.setValue(32)
             
             # 4. Push clean baseline states across view controllers
             self.apply_cinematic_fx_to_viewport()
             self.view.Tweak()
-            print("[Preset Engine] Active FX profiles dismantled. Viewport restored to studio baseline configuration.")
+            self.glob.env.logLine(1, "[Make Light, Preset Engine] Active FX profiles dismantled. Viewport restored to studio baseline configuration.")
         except Exception as err:
-            print(f"[Preset Engine Error] Deactivation loop dropped a property assignment fault: {str(err)}")
+            self.glob.env.logLine(1, f"[Make Light, Preset Engine Error] Deactivation loop dropped a property assignment fault: {str(err)}")
+
+
+    def pause_or_resume(self):
+        if self.pause is False:
+            self.stop_fx_math_timer()
+            self.stop_tracking_timer()
+        else:
+            self.start_fx_math_timer()
+            self.start_tracking_timer()
+        self.pause = not self.pause
+        self.panel.setPauseText()
 
     def toggle_procedural_math_engine(self):
         """Main calculation routine managing frame rendering parameters over time."""
-        routine = self.procedural_picker.currentData()
+        routine = self.panel.procedural_picker.currentData()
         
         # Define an explicit instance loop target to guarantee clean disconnect tracks
-        if not hasattr(self, 'fx_math_timer'):
+        if self.fx_math_timer is None:
             self.fx_math_timer = QTimer(self)
             self.fx_math_frame_counter = 0.0
             self._current_active_slot = None
@@ -619,9 +580,9 @@ class CommunityLightPresetPanel(QWidget):
                 pass
             self._current_active_slot = None
 
-        if routine == "none" and not self.gobo_picker.currentData() != "none" and not self.lut_picker.currentData() != "none" and not self.toon_toggle.isChecked():
-            self.fx_math_timer.stop()
-            print("[Preset FX] Procedural math engine completely disconnected and freed.")
+        if routine == "none" and not self.panel.gobo_picker.currentData() != "none" and not self.panel.lut_picker.currentData() != "none" and not self.panel.toon_toggle.isChecked():
+            self.stop_fx_math_timer()
+            self.glob.env.logLine(2, "[Make Light, Preset FX] Procedural math engine completely disconnected and freed.")
             return
             
         def run_math_frame_calculations():
@@ -630,7 +591,7 @@ class CommunityLightPresetPanel(QWidget):
             
             # FIXED: Safe type conversion that defaults to 5 if the widget data drops a string formatting fault
             try:
-                raw_level = self.amount_picker.currentData()
+                raw_level = self.panel.amount_picker.currentData()
                 intensity_scale = float(raw_level) if raw_level else 5.0
             except (TypeError, ValueError):
                 intensity_scale = 5.0
@@ -768,8 +729,7 @@ class CommunityLightPresetPanel(QWidget):
                     
                     # 1. Update your viewport's ambient canvas background color directly
                     sky_color = QColor.fromRgbF(r_sky * 0.25, g_sky * 0.25, b_sky * 0.25)
-                    if hasattr(self.light_sys, 'setClearColor'):
-                        self.light_sys.setClearColor(sky_color)
+                    self.light_sys.setClearColor(sky_color)
                         
                     # 2. Project glowing environment reflection hues onto the lights collection
                     for idx in range(total_lights):
@@ -779,9 +739,9 @@ class CommunityLightPresetPanel(QWidget):
                 # =========================================================================
                 # PASS B: PROCEDURAL LIGHTSPHERE / GOBO / LUT MATH INJECTIONS
                 # =========================================================================
-                gobo_active = self.gobo_picker.currentData()
-                lut_active = self.lut_picker.currentData()
-                toon_active = self.toon_toggle.isChecked()
+                gobo_active = self.panel.gobo_picker.currentData()
+                lut_active = self.panel.lut_picker.currentData()
+                toon_active = self.panel.toon_toggle.isChecked()
 
                 if (gobo_active != "none" or lut_active != "none" or toon_active) and total_lights > 0:
                     for idx in range(total_lights):
@@ -827,16 +787,16 @@ class CommunityLightPresetPanel(QWidget):
 
                 self.view.Tweak()
             except Exception as e:
-                print(f"[Math Engine Failure] Auto-aborting procedural routine loops: {str(e)}")
-                self.fx_math_timer.stop()
+                self.glob.env.logLine(1, f"[Make Light, Math Engine Failure] Auto-aborting procedural routine loops: {str(e)}")
+                self.stop_fx_math_timer()
 
         # Cache the current active slot reference before starting the execution tracking loop
-        self._current_active_slot = run_math_frame_calculations
-        self.fx_math_timer.timeout.connect(self._current_active_slot)
+        #self._current_active_slot = run_math_frame_calculations
+        #self.fx_math_timer.timeout.connect(self._current_active_slot)
         # =========================================================================
         # DYNAMIC HARDWARE SPEED MATRIX (Calculates optimized millisecond delays)
         # =========================================================================
-        pc_profile = self.hardware_picker.currentData()
+        pc_profile = self.panel.hardware_picker.currentData()
         
         # 1. Establish the baseline framework speeds for the chosen hardware profile
         if pc_profile == "low_end":
@@ -871,7 +831,7 @@ class CommunityLightPresetPanel(QWidget):
         
         # Turn on the timer using our dynamically calculated hardware speed!
         self.fx_math_timer.start(optimized_ms_delay)
-        print(f"[Preset FX] Math matrix engaged. Optimized loop delay: {optimized_ms_delay}ms ({pc_profile} mode)")
+        self.glob.env.logLine(2, f"[Make Light, Preset FX] Math matrix engaged. Optimized loop delay: {optimized_ms_delay}ms ({pc_profile} mode)")
 
 
     def capture_and_save_active_preset(self):
@@ -880,13 +840,13 @@ class CommunityLightPresetPanel(QWidget):
         live_scene_sys = self.scene_sys
 
         if not live_light_sys or not live_scene_sys:
-            print("[Preset Engine Error] Critical: True live viewport scene systems could not be resolved.")
+            self.glob.env.logLine(1, "[Make Ligth, Preset Engine Error] Critical: True live viewport scene systems could not be resolved.")
             return
 
         # 1. LAUNCH THE METADATA WINDOW FOR MANUAL USER INPUT
         meta_dialog = SavePresetMetadataDialog(self)
         if meta_dialog.exec_() != QDialog.Accepted:
-            print("[Preset Engine] Save cycle aborted by user.")
+            self.glob.env.logLine(1, "[Make Light, Preset Engine] Save cycle aborted by user.")
             return
             
         user_meta = meta_dialog.get_metadata()
@@ -896,8 +856,9 @@ class CommunityLightPresetPanel(QWidget):
             QMessageBox.warning(self, "Invalid Name", "Preset profile name cannot be left blank.")
             return
 
-        clean_filename = "".join([c for c in preset_name.lower() if c.isalnum() or c in (" ", "", "-")]).replace(" ", "")
-        target_file_path = os.path.join(self.presets_dir, f"{clean_filename}.json").replace("\\", "/")
+        # create a clean name and save to user-presets
+        clean_filename = self.glob.env.normalizeName(preset_name)
+        target_file_path = os.path.join(self.user_presets_dir, f"{clean_filename}.json").replace("\\", "/")
 
         if os.path.isfile(target_file_path):
             confirm_overwrite = QMessageBox.question(
@@ -906,92 +867,30 @@ class CommunityLightPresetPanel(QWidget):
                 QMessageBox.Yes | QMessageBox.No
             )
             if confirm_overwrite == QMessageBox.No:
-                print(f"[Preset Engine] Save cycle aborted by user to protect existing file.")
                 return
 
         try:
-            # Calculate ambient lighting weight allocations
-            amb_weight = 20.0
-            if hasattr(live_light_sys, 'ambientLight') and isinstance(live_light_sys.ambientLight, QVector4D):
-                amb_weight = float(live_light_sys.ambientLight.w()) * 100.0
-            elif hasattr(live_light_sys, 'shaderInit'):
-                raw_amb_col = live_light_sys.shaderInit.get("ambientcolor", [0.2, 0.2, 0.2, 0.2])
-                if isinstance(raw_amb_col, (list, tuple)) and len(raw_amb_col) > 3:
-                    amb_weight = float(raw_amb_col[3]) * 100.0
-                elif isinstance(raw_amb_col, (int, float)):
-                    amb_weight = float(raw_amb_col) * 100.0
-
-            amb_color_list = [0.2, 0.2, 0.2]
-            if hasattr(live_light_sys, 'ambientLight') and isinstance(live_light_sys.ambientLight, QVector4D):
-                amb_color_list = [
-                    round(live_light_sys.ambientLight.x(), 4),
-                    round(live_light_sys.ambientLight.y(), 4),
-                    round(live_light_sys.ambientLight.z(), 4)
-                ]
-            elif hasattr(live_light_sys, 'shaderInit'):
-                raw_amb_col = live_light_sys.shaderInit.get("ambientcolor", [0.2, 0.2, 0.2])
-                if isinstance(raw_amb_col, (list, tuple)) and len(raw_amb_col) >= 3:
-                    amb_color_list = [round(float(c), 4) for c in raw_amb_col[:3]]
-
-            clear_color_list = [0.05, 0.05, 0.05]
-            gl_clear = getattr(live_light_sys, 'glclearcolor', None)
-            if gl_clear and hasattr(gl_clear, '__len__') and len(gl_clear) >= 3:
-                clear_color_list = [round(float(c), 4) for c in gl_clear[:3]]
-            elif gl_clear and isinstance(gl_clear, QColor):
-                clear_color_list = [round(gl_clear.redF(), 4), round(gl_clear.greenF(), 4), round(gl_clear.blueF(), 4)]
-
-            # Flatten floor sizing arrays down safely
-            raw_floor_size = getattr(live_scene_sys, 'floorsize', 10)
-            if isinstance(raw_floor_size, (list, tuple, np.ndarray)):
-                try:
-                    flat_fs = np.array(raw_floor_size).flatten()
-                    raw_floor_size = flat_fs[0] if flat_fs.size > 0 else 10
-                except Exception:
-                    raw_floor_size = 10
-            try:
-                floor_size_val = int(float(raw_floor_size))
-            except (TypeError, ValueError):
-                floor_size_val = 10
-
-            # RUN ABSOLUTE PATH ISOLATION ON SCENE STRINGS
-            raw_texture = getattr(live_scene_sys, 'floortexture', 'default')
-            if callable(raw_texture):
-                try: raw_texture = raw_texture()
-                except Exception: pass
-            elif hasattr(raw_texture, 'text'):
-                try: raw_texture = raw_texture.text()
-                except Exception: pass
-            
-            # Isolates just "image_of_choice.png" instead of system directory paths
-            floor_texture_str = os.path.basename(str(raw_texture)).strip()
-            if not floor_texture_str or floor_texture_str.lower() in ("none", "false", "default"):
-                floor_texture_str = "default"
-
-            # Pull color list elements
-            floor_color_list = [0.5, 0.5, 0.5]
-            if hasattr(live_scene_sys, 'floorcolor'):
-                raw_fc = live_scene_sys.floorcolor
-                if hasattr(raw_fc, 'redF'):
-                    floor_color_list = [round(raw_fc.redF(), 4), round(raw_fc.greenF(), 4), round(raw_fc.blueF(), 4)]
-                elif isinstance(raw_fc, (list, tuple, np.ndarray)) and len(raw_fc) >= 3:
-                    floor_color_list = [round(float(c), 4) for c in raw_fc[:3]]
+            # Calculate ambient lighting weight allocations, use endpoints defined in scene.py and light.py
+            #
+            amb_weight = live_light_sys.getAmbientLuminance() * 100.0
+            amb_color_list = live_light_sys.getAmbientColor()
+            clear_color_list = live_light_sys.getClearColor()
+            floor_size_val = live_scene_sys.getFloorSizeFloat()
+            floor_texture_str = live_scene_sys.getFloorTexture()
 
             compiled_lights_list = []
-            if hasattr(live_light_sys, 'lights') and isinstance(live_light_sys.lights, list):
-                for l_idx, elem in enumerate(live_light_sys.lights):
-                    raw_vol = elem.get("vol", [1.0, 1.0, 1.0])
-                    l_color_list = [round(raw_vol.x(), 4), round(raw_vol.y(), 4), round(raw_vol.z(), 4)] if hasattr(raw_vol, 'x') else [round(float(c), 4) for c in raw_vol[:3]]
-                    
-                    raw_pos = elem.get("pos", [0.0, 5.0, 0.0])
-                    l_pos_list = [round(raw_pos.x(), 4), round(raw_pos.y(), 4), round(raw_pos.z(), 4)] if hasattr(raw_pos, 'x') else [round(float(p), 4) for p in raw_pos[:3]]
 
-                    compiled_lights_list.append({
-                        "id": l_idx,
-                        "type": 0 if str(elem.get("type", 1)).lower() in ("0", "directional") else 1,
-                        "luminance": float(elem.get("int", 5.0)),
-                        "color": l_color_list,
-                        "position": l_pos_list
-                    })
+            for l_idx in range (live_light_sys.numLights()):
+                l_color_list = live_light_sys.getLColor(l_idx)
+                l_pos_list = live_light_sys.getLPos(l_idx)
+
+                compiled_lights_list.append({
+                    "id": l_idx,
+                    "type": live_light_sys.getType(l_idx),
+                    "luminance": live_light_sys.getLLuminance(l_idx),
+                    "color": l_color_list,
+                    "position": l_pos_list
+                })
 
             preset_master_structure = {
                 "preset_name": preset_name,
@@ -1002,11 +901,10 @@ class CommunityLightPresetPanel(QWidget):
                 "clear_color": clear_color_list,
                 "floor_texture": floor_texture_str, 
                 "floor_size": floor_size_val,       
-                "floor_color": floor_color_list,
-                "harsh_key_light": self.harsh_light_toggle.isChecked(),
-                "use_blinn_shading": self.blinn_toggle.isChecked(),
-                "use_toon_shading": self.toon_toggle.isChecked(),
-                "material_specular_focus": self.specular_slider.value(),
+                "harsh_key_light": self.panel.harsh_light_toggle.isChecked(),
+                "use_blinn_shading": self.panel.blinn_toggle.isChecked(),
+                "use_toon_shading": self.panel.toon_toggle.isChecked(),
+                "material_specular_focus": self.panel.specular_slider.value(),
                 "lights": compiled_lights_list
             }
 
@@ -1017,13 +915,11 @@ class CommunityLightPresetPanel(QWidget):
             QMessageBox.information(self, "Preset Saved!", f"Successfully captured setup as '{preset_name}'!")
 
         except Exception as err:
-            import traceback
-            traceback.print_exc()
-            print(f"[Preset Engine Error] Automated scene serialization fault: {err}")
+            self.glob.env.logLine(1, f"[Make Light, Preset Engine Error] Automated scene serialization fault: {err}")
 
     def delete_selected_preset(self):
         """Erases files from local workspace path tracks safely."""
-        current_item = self.preset_list.currentItem()
+        current_item = self.panel.preset_list.currentItem()
         if not current_item:
             QMessageBox.warning(self, "No Selection", "Please highlight a lighting preset profile row from the list to delete.")
             return
@@ -1032,7 +928,7 @@ class CommunityLightPresetPanel(QWidget):
         if not filename_key:
             return
         
-        target_file_path = os.path.join(self.presets_dir, filename_key).replace("\\", "/")
+        target_file_path = os.path.join(self.sys_presets_dir, filename_key).replace("\\", "/")
 
         confirm_box = QMessageBox.question(
             self, "Confirm Delete", 
@@ -1044,55 +940,120 @@ class CommunityLightPresetPanel(QWidget):
             try:
                 if os.path.isfile(target_file_path):
                     os.remove(target_file_path)
-                    print(f"[Preset Engine] Successfully removed file: {target_file_path}")
+                    self.glob.env.logLine(2, f"[Make Light, Preset Engine] Successfully removed file: {target_file_path}")
                     self.scan_presets_folder()
                     QMessageBox.information(self, "Deleted", "Successfully deleted preset file.")
                 else:
                     QMessageBox.critical(self, "Error", "Could not delete: Preset file no longer exists at destination.")
             except Exception as delete_fault:
-                print(f"[Preset Engine Error] System file removal operation collapsed: {delete_fault}")
+                self.glob.env.logLine(1, f"[Make Light, Preset Engine Error] System file removal operation collapsed: {delete_fault}")
 
-    def initialize_live_viewport_tracking_heartbeat(self):
-        def execute_live_comparison_sweep():
-            if not self.light_sys or not hasattr(self.light_sys, 'ambientLight'):
-                return
-            try:
-                if isinstance(self.light_sys.ambientLight, QVector4D):
-                    live_amb_lum = round(float(self.light_sys.ambientLight.w()) * 100.0, 1)
-                else:
-                    return
+    def execute_live_comparison_sweep(self):
+        live_amb_lum = round(self.light_sys.getAmbientLuminance()  * 100.0, 1)
                     
-                for row_idx in range(self.preset_list.count()):
-                    list_item = self.preset_list.item(row_idx)
-                    filename_key = list_item.data(Qt.UserRole)
+        for row_idx in range(self.panel.preset_list.count()):
+            list_item = self.panel.preset_list.item(row_idx)
+            filename_key = list_item.data(Qt.UserRole)
 
-                    if not filename_key or filename_key not in self.scanned_presets:
-                        continue
+            if not filename_key or filename_key not in self.scanned_presets:
+                continue
                         
-                    f_data = self.scanned_presets[filename_key]
-                    raw_file_amb = f_data.get("ambient_luminance", 20.0)
+            f_data = self.scanned_presets[filename_key]
+            raw_file_amb = f_data.get("ambient_luminance", 20.0)
                     
-                    if isinstance(raw_file_amb, (list, tuple, np.ndarray)):
-                        try:
-                            flat_array = np.array(raw_file_amb).flatten()
-                            raw_file_amb = flat_array[0] if flat_array.size > 0 else 20.0
-                        except Exception:
-                            raw_file_amb = 20.0
+            if isinstance(raw_file_amb, (list, tuple, np.ndarray)):
+                try:
+                    flat_array = np.array(raw_file_amb).flatten()
+                    raw_file_amb = flat_array[0] if flat_array.size > 0 else 20.0
+                except Exception:
+                    raw_file_amb = 20.0
                             
-                    try:
-                        file_amb_lum = round(float(raw_file_amb), 1)
-                    except (TypeError, ValueError):
-                        file_amb_lum = 20.0
+            try:
+                file_amb_lum = round(float(raw_file_amb), 1)
+            except (TypeError, ValueError):
+                file_amb_lum = 20.0
                         
-                    if abs(live_amb_lum - file_amb_lum) < 0.5:
-                        theme_accent = QApplication.palette().color(QPalette.Highlight)
-                        theme_accent.setAlpha(45)
-                        list_item.setBackground(QBrush(theme_accent))
-                    else:
-                        list_item.setBackground(QBrush(QColor(0, 0, 0, 0)))
-            except Exception:
-                pass
+            if abs(live_amb_lum - file_amb_lum) < 0.5:
+                theme_accent = QApplication.palette().color(QPalette.Highlight)
+                theme_accent.setAlpha(45)
+                list_item.setBackground(QBrush(theme_accent))
+            else:
+                list_item.setBackground(QBrush(QColor(0, 0, 0, 0)))
 
+
+    def shutdown(self):
+        self.glob.env.logLine(1, "[Light Presets shutdown ")
+        if self.panel:
+            self.deactivate_all_fx_overrides()
+            self.panel.close()
+            self.panel.deleteLater()
+
+        self.stop_tracking_timer()
+
+        if self.dock:
+            self.main_window.removeDockWidget(self.dock)
+            self.dock.close()
+            self.dock.deleteLater()
+        self.dock = None
+        self.panel = None
+
+    def initialize(self, docked=False):
+        """
+        the initialize function for this dock panel
+        docked: if false, then standalone version is used
+        """
+        if self.pluginname in self.repo:
+            # if loaded second time
+            # Clean up old references just in case
+            self.shutdown()
+
+        # create the dock widget including UI
+        #
+        if docked:
+            self.dock = QDockWidget("Community Lighting Presets Manager", self.main_window)
+            self.dock.setObjectName("community_light_presets_dock_frame")
+            self.dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+            self.panel = self.Panel(self)
+            self.dock.setWidget(self.panel)
+            if hasattr(self.main_window, "addDockWidget"):
+                self.main_window.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+            else:
+                self.dock.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+            self.dock.show()
+        else:
+            self.panel = self.Panel(self)
+
+        self.create_presets_directories()
+        self.scan_presets_folder()
+
+        # tracking timer
+        #
         self.tracking_timer = QTimer(self)
-        self.tracking_timer.timeout.connect(execute_live_comparison_sweep)
+        self.tracking_timer.timeout.connect(self.execute_live_comparison_sweep)
         self.tracking_timer.start(2000)
+
+        QTimer.singleShot(100, self.establish_dock_signal_tracking_hooks)
+
+        # now add plugin to repository
+        #
+        self.repo[self.pluginname] = self
+        return True
+
+def load_extension(app_reference, glob_reference=None):
+    """
+    MH2 COMPLIANCE HOOK: Spawns the panel container safely
+    within the native dashboard interface framework.
+    """
+    glob_reference.env.logLine(1, "[Make Light] Initializing ...")
+
+    pluginname = os.path.abspath(__file__)
+    plugin = CommunityLightPresetPanel(app_reference, glob_reference, pluginname)
+    return plugin.initialize(True)
+
+
+def unload_extension(glob):
+    pluginname = os.path.abspath(__file__)
+    if pluginname in glob.pluginRepo:
+        glob.pluginRepo[pluginname].shutdown()
+        glob.pluginRepo.pop(pluginname)     # and delete from repo
+
